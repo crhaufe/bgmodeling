@@ -1,0 +1,496 @@
+"""
+"""
+#import sys
+#sys.path.insert(0,"/Users/crhaufe/bgmodeling/FitSpectra_Chris/FitSpectra/Classes")
+#import Model
+import os
+import sys
+import time
+import subprocess
+import numpy as np
+import pandas as pd
+import pickle as pl
+import glob
+import pymc3 as pm
+import matplotlib.pyplot as plt
+import theano
+import theano.tensor as tt
+from tqdm import tqdm
+from scipy.stats import mode
+from scipy.stats import truncnorm
+from scipy.stats import norm
+from scipy.stats import poisson
+from tabulate import tabulate
+from pymc3.plots.kdeplot import fast_kde
+from pymc3.stats import hpd
+from pymc3.backends.tracetab import trace_to_dataframe
+from pymc3.sampling import sample_ppc
+
+class TraceTools:
+    """
+    """
+    def __init__(self, settings):
+        self.settings = settings
+
+    def SetModel(self, model):
+        self.model = model
+        self.trace = model.trace
+
+    def LoadTrace(self, trace_dirname):
+        """
+        Load a trace.
+        """
+        st = self.settings
+
+        print('Loading saved trace: %s' % trace_dirname)
+        return pm.load_trace(trace_dirname, self.trace)
+
+    def GetTraceValues(self, varname):
+        """
+        Ref:
+            https://docs.pymc.io/api/backends.html
+        """
+        st = self.settings
+        return self.trace.get_values(varname, burn = st.mcmc_warmup, combine = True) # trace[varname][st.mcmc_warmup:]
+
+    def GetTraceDataFrame(self):
+        """
+        Ref:
+            https://docs.pymc.io/api/backends.html
+        """
+        return trace_to_dataframe(self.trace)
+
+    #def PrintDivergences(self):
+    #    """
+    #    display the total number and percentage of divergent iterations
+    #    """
+    #    st = self.settings
+    #    print(st.mcmc_step_method)
+    #    trace = self.trace
+    #    print(trace.stat_names)
+    #    divergent = trace["diverging"]
+    #    print("*************")
+    #    print("Number of Divergent %d" % divergent.nonzero()[0].size)
+    #    divperc = divergent.nonzero()[0].size / len(trace) * 100
+    #    print("Percentage of Divergent %.1f" % divperc)
+    #    print("*************")
+
+    def SamplePosteriorPredictive(self, trace_type = None, samples = 1, size = 1, save = False):
+        """
+        Samples is number of points along the trace/chain to sample.
+        Size is number of random draws from the distribution specified by the
+        parameters in each sample of the trace.
+        Typical uses will probably be
+            sample the distributions centered on the posterior means (trace_type = 'mean', samples = 1, size = many)
+            sample the posterior distributions (trace_type = 'trace', samples = len_trace, size = 1)
+        Ref:
+        https://docs.pymc.io/api/inference.html#module-pymc3.sampling
+        """
+        st = self.settings
+
+        varnames = []
+        if trace_type == None or trace_type == 'trace':
+            trace = self.trace
+        if trace_type == 'means':
+            # get the free_rv means
+            # Ref: https://discourse.pymc.io/t/evaluate-logposterior-at-sample-points/235/2
+            for name in self.trace.varnames:
+                if 'lowerbound' in name: continue #to correct for issue where varnames end in '_lowerbound__'.  Still need to find origin of this.
+                else: varnames.append(name)
+            trace = [{name: self.GetTraceValues(name).mean() for name in varnames}]
+        #print(trace[st.mcmc_warmup:])
+        #sys.exit()
+        self.model.ppc_d = sample_ppc(trace = trace[st.mcmc_warmup:], model = self.model.pymc_model, \
+            samples = samples, size = size) #originally trace = trace[st.mcmc_warmup:]
+        print('TraceTools::SamplePosteriorPredictive(): ppc_d')
+        for key, value in self.model.ppc_d.items():
+            print('    ', key, value.shape)
+        if save==True:
+            base_dir = os.environ['MODEL_DIR']
+            model_dir = st.model_dirname.lstrip('../../FitSpectra_Models/')
+            array_dir = base_dir + '/' + model_dir + '/PPC_Plots/ppcs/'
+            ppc_name = array_dir + 'ppc_' + str(samples) + '.pkl'
+            ppc_d = self.model.ppc_d
+            if not os.path.exists(array_dir):
+                os.makedirs(array_dir)
+                with open(ppc_name, 'wb') as ppc_file:
+                    pl.dump(ppc_d, ppc_file)
+            else: #still save if there's a different number of samples in the ppc
+                if not os.path.exists(ppc_name):
+                    with open(ppc_name, 'wb') as ppc_file:
+                        pl.dump(ppc_d, ppc_file)
+                else:
+                    print('WARNING: ALREADY HAVE PPC WITH SAME NUMBER OF SAMPLES, SKIPPING SAVE')
+                    return
+
+    def CalcCovCorrMatrices(self, request):
+        """
+        """
+        df = self.GetTraceDataFrame()
+        self.model.cov = df.cov()
+        self.model.corr = df.corr()
+        if request=='cov':
+          return self.model.cov
+        elif request=='corr':
+          return self.model.corr
+        else:
+          return self.model.cov, self.model.corr
+
+    def CalcPointEstimate(self, trace_values, point_estimate):
+        """
+        Calculate std, mean, mode, or median from a trace.
+        Ref:
+            https://github.com/pymc-devs/pymc3/blob/master/pymc3/plots/artists.py#L77
+        """
+        if point_estimate == 'std':
+            point_value = trace_values.std()
+        elif point_estimate == 'mean':
+            point_value = trace_values.mean()
+        elif point_estimate == 'mode':
+            if isinstance(trace_values[0], float):
+                density, l, u = fast_kde(trace_values, bw = 4.5)
+                x = np.linspace(l, u, len(density))
+                point_value = x[np.argmax(density)]
+            else:
+                point_value = mode(trace_values.round(round_to))[0][0]
+        elif point_estimate == 'median':
+            point_value = np.median(trace_values)
+        return point_value
+
+    def CalcPointEstimates(self):
+        """
+        Calculate point estimates from the floated parameter traces.
+        Then store the estimates with each model.submodel.component.
+        Also store the estimates in the submodel.dag_df for easy access.
+        """
+        st = self.settings
+        model = self.model
+        trace = self.trace
+
+        # Calculate point estimates
+        print('Calculating point estimates:')
+        d = {}
+        for var in model.pymc_model.deterministics: # for i, varname in enumerate(trace.varnames)
+            varname = var.name
+            trace_values = self.GetTraceValues(varname)
+            d[varname] = {
+                'std': self.CalcPointEstimate(trace_values, 'std'),
+                'mean': self.CalcPointEstimate(trace_values, 'mean'),
+                'mode': self.CalcPointEstimate(trace_values, 'mode'),
+                'median': self.CalcPointEstimate(trace_values, 'median')
+            }
+            # print('    %s %.3f %.3f %.3f %.3f' % (varname, d[varname]['std'], d[varname]['mean'], d[varname]['mode'], d[varname]['median']) )
+            print('    %s %.9f' % (varname, d[varname]['mode']) )
+
+        # Assign those estimates to component objects
+        for submodel in model.submodel_list:
+            for component in submodel.component_list:
+                if component.floated:
+                    for rv_name_type in ['hp_rv_name', 'p_rv_name']:
+                        if rv_name_type == 'hp_rv_name':
+                            def h(str):
+                                return 'h' + str
+                        if rv_name_type == 'p_rv_name':
+                            def h(str):
+                                return str
+
+                        varname = submodel.dag_df[component.name][h('p_rv_name')]
+                        if varname == None: continue
+
+                        if rv_name_type == 'hp_rv_name':
+                            component.hp_rv_name = varname
+                            component.hp_std = d[varname]['std']
+                            component.hp_mean = d[varname]['mean']
+                            component.hp_mode = d[varname]['mode']
+                            component.hp_median = d[varname]['median']
+
+                            submodel.dag_df[component.name][h('p_std')] = d[varname]['std']
+                            submodel.dag_df[component.name][h('p_mean')] = d[varname]['mean']
+                            submodel.dag_df[component.name][h('p_mode')] = d[varname]['mode']
+                            submodel.dag_df[component.name][h('p_median')] = d[varname]['median']
+
+                        if rv_name_type == 'p_rv_name':
+                            component.p_rv_name = varname
+                            component.p_std = d[varname]['std']
+                            component.p_mean = d[varname]['mean']
+                            component.p_mode = d[varname]['mode']
+                            component.p_median = d[varname]['median']
+
+                            submodel.dag_df[component.name][h('p_std')] = d[varname]['std']
+                            submodel.dag_df[component.name][h('p_mean')] = d[varname]['mean']
+                            submodel.dag_df[component.name][h('p_mode')] = d[varname]['mode']
+                            submodel.dag_df[component.name][h('p_median')] = d[varname]['median']
+
+            submodel.AppendPointEstimatesToDAGDF()
+
+    def CalcHPD(self, trace_values, alpha = (1-.6827)/2.):
+        """
+        Calculate highest posterior density (HPD) of array for given alpha.
+        The HPD is the minimum width Bayesian credible interval (BCI).
+        Ref:
+            https://docs.pymc.io/api/stats.html
+        """
+        return hpd(trace_values, alpha = alpha)
+
+    def CalcHPDs(self):
+        """
+        Calculate point estimates from the floated parameter traces.
+        Then store the estimates with each model.submodel.component.
+        Also store the estimates in the submodel.dag_df for easy access.
+        """
+        st = self.settings
+        model = self.model
+        trace = self.trace
+
+        print('Calculating HPDs:')
+        d = {}
+        for var in model.pymc_model.deterministics: # for i, varname in enumerate(trace.varnames)
+            varname = var.name
+            trace_values = self.GetTraceValues(varname)
+            d[varname] = {
+                'hpd': self.CalcHPD(trace_values),
+            }
+            print('    %s (%.3f, %.3f)' % (varname, d[varname]['hpd'][0], d[varname]['hpd'][1]) )
+
+        for submodel in model.submodel_list:
+            for component in submodel.component_list:
+                if component.floated:
+                    for rv_name_type in ['hp_rv_name', 'p_rv_name']:
+                        if rv_name_type == 'hp_rv_name':
+                            def h(str):
+                                return 'h' + str
+                        if rv_name_type == 'p_rv_name':
+                            def h(str):
+                                return str
+
+                        varname = submodel.dag_df[component.name][h('p_rv_name')]
+                        if varname == None: continue
+
+                        if rv_name_type == 'hp_rv_name':
+                            component.hp_hpd = d[varname]['hpd']
+
+                            submodel.dag_df[component.name][h('p_hpd')] = d[varname]['hpd']
+
+                        if rv_name_type == 'p_rv_name':
+                            component.p_hpd = d[varname]['hpd']
+
+                            submodel.dag_df[component.name][h('p_hpd')] = d[varname]['hpd']
+
+    def GetAvgModeAndError(self):
+        """
+        For multiple traces of the same type (model) of fit, get the average mode of all traces.  Return varname dictionary.
+        """
+        st = self.settings
+        #model = self.model
+        tracelist = glob.glob(st.model_dirname + '/trace_*')
+        varnames = []
+        modeslist = {}
+        modes = {}
+        avg_p_modes = {}
+        p_scales = {}
+        i = 0
+        #for var in model.pymc_model.deterministics:
+        #    varname = var.name
+        #    varnames.append(varname)
+        for tracedir in tracelist:
+            #trace = self.LoadTrace(tracedir, model_obj)
+            i+=1
+            trace = pd.read_pickle(tracedir + '/trace.pkl')
+            for col in trace.columns: #columns are varnames
+                trace_values = trace[col].tolist()
+                #trace_values = trace_values_w_burn[st.mcmc_warmup:]
+                tmp_mode = self.CalcPointEstimate(trace_values, 'mode')
+                if col not in modeslist.keys():
+                    firstmode = [tmp_mode]
+                    modeslist[col] = firstmode
+                else:
+                    modeslist[col].append(tmp_mode)
+                #if i==20 and 'Th232' in col:
+                #    print('LIST OF MODES FOR VARNAME %s AFTER TRACE %i IS:' % (col,i))
+                #    print(modeslist[col]) 
+        for key in modeslist.keys():
+            if modeslist[key] is None:
+                continue
+            modes[key] = np.array(modeslist[key])
+            avg_p_modes[key] = np.mean(modes[key])
+            p_scales[key] = np.std(modes[key])
+        return avg_p_modes, p_scales
+
+    def PrintConvergenceInfo(self):
+        """
+        Print various tables and plots related to the trace of the fit
+        """
+        st = self.settings
+        model = self.model
+        trace = self.trace
+        base_dir = os.environ['MODEL_DIR']
+        model_dir = st.model_dirname.lstrip('../../FitSpectra_Models/')
+        plot_dir = base_dir + '/' + model_dir + '/ConvergencePlots/'
+        fig_name = 'traceplot.pdf'
+        pm.traceplot(trace)
+        fig_filename = plot_dir + fig_name
+        if not os.path.exists(plot_dir):
+            os.makedirs(plot_dir)
+        plt.savefig(fig_filename, bbox_inches='tight')
+
+    def ImportanceSampling(self, nsamples):
+        """
+        Perform importance sampling on the posterior, given the component means and covariance matrix
+        """
+        st = self.settings
+        model = self.model
+        means = {}
+        stds = {}
+        samples = {}
+        np.random.seed(2024075129)
+
+        #Get means for every submodel
+        #for submodel in model.submodel_list:
+        #  print(submodel.dag_df[['Component_Th_M1LMFEs_bulk_1_0_2_DS3-6_best_std']].to_string(index=False))
+        #  means[submodel] = submodel.dag_df.loc['p_mean'].values #convert into np array of means
+        #  print(means[submodel].shape)
+
+        for submodel in model.submodel_list:
+          for component in submodel.component_list:
+            if component.floated:
+              means[submodel] = component.p_mean
+              stds[submodel] = component.p_std
+              #print(component.p_mean)
+              #print(component.p_std)
+              #print("SHOULD BE 8 OF THESE!")
+
+        #Get model covariance matrix (same for every submodel)? - if floating more than one component
+        #cov_pandas = self.CalcCovCorrMatrices('cov')
+        #cov = cov_pandas.values
+
+        #Get std if just floating one component
+        #  stds[submodel] = submodel.dag_df.loc['p_std'].values
+        #  print(stds[submodel].shape)
+        
+        #Record time to do the sampling
+        print("Doing the importance sampling!")
+        startTime = time.time()
+
+        #Do the sampling
+        #For floating more than one component
+        #for submodel in model.submodel_list:
+        #  rng = np.random.default_rng()
+        #  samples[submodel] = rng.multivariate_normal(np.array(means[submodel]), np.array(cov), size = nsamples)
+
+        #For floating only one component
+        for submodel in model.submodel_list:
+          samples[submodel] = np.random.normal(means[submodel], stds[submodel], nsamples)
+
+        #Check time elapsed, shape, and content
+        #print("Sampling time is (sec): " + str(time.time() - startTime))
+        #print(samples[model.submodel_list[0]].shape)
+        #print(samples[model.submodel_list[0]]) #Look at first submodel only
+
+        #Pass dictionary of samples to a calculator for the marginal likelihood
+        #ml = self.CalculateMarginalLikelihood(samples)
+
+        #Return the marginal likelihood
+        return samples
+
+    def CalculateMarginalLikelihood(self, samples):
+        """
+        Calculate the marginal likelihood using samples from an importance sampling method.
+        """
+        st = self.settings
+        model = self.model
+
+        marg_likelihood = {}
+
+        #Get means and standard deviations for prior and approx_prior, then setup those distributions        
+        for submodel in model.submodel_list:
+          for component in submodel.component_list:
+            if component.floated:
+              mean = component.p_mean
+              std = component.p_std
+              assay_mean = component.prior_loc
+              assay_std = component.prior_scale
+              name = component.name
+              break
+          prior = pm.TruncatedNormal.dist(mu = assay_mean, sd = assay_std, lower = 0., upper = np.inf)
+          approx_prior = pm.TruncatedNormal.dist(mu = mean, sd = std, lower = 0., upper = np.inf)
+
+          p = []
+          nsamples = len(samples[submodel])
+          float_index = submodel.dag_df.columns.get_loc(name)
+          p_mean_vals = submodel.dag_df.loc['prior_loc'].values.tolist()
+          pdf_effs = tt.stack(submodel.dag_df.loc['fit_engine_dist'].values.tolist())
+
+          #Compile marginal likelihood calculation before entering loop
+          #loop_calc = self.marg_likelihood_calc_compiled()
+
+          for sample in tqdm(samples[submodel], desc = 'Calculating marginal likelihoods for submodel ' + submodel.name + '...'):
+            p_mean_vals[float_index] = sample
+            w = tt.stack(p_mean_vals)
+            logp = tt.log(w) + tt.log(pdf_effs).T
+            mu = tt.sum(tt.exp(logp), axis=1)
+            likelihood = pm.Poisson.dist(mu = mu)
+            p.append(tt.sum(likelihood.logp(submodel.fit_engine_dist)).eval() + prior.logp(sample).eval() - approx_prior.logp(sample).eval())
+          marg_likelihood[submodel.name] = sum(p)/nsamples
+
+        #delete some vars
+        del likelihood
+        del prior
+        del approx_prior
+        del p
+
+        return marg_likelihood
+
+    def CalculateMarginalLikelihood_v2(self, samples):
+        """"
+        Calculate the marginal likelihood using samples from an importance sampling method.  This method cuts out theano in favor of numpy and scipy
+        """
+        st = self.settings
+        model = self.model
+
+        marg_likelihood = {}
+        
+        #Get means and standard deviations for prior and approx_prior, then setup those distributions
+        for submodel in model.submodel_list:
+          for component in submodel.component_list:
+            if component.floated:
+              mean = component.p_mean
+              std = component.p_std
+              assay_mean = component.prior_loc
+              assay_std = component.prior_scale
+              name = component.name
+              break
+          prior = truncnorm(0., np.inf, loc = assay_mean, scale = assay_std)
+          approx_prior = norm(loc = mean, scale = std)
+
+          p = []
+          bin_likelihoods = []
+          bin_mls = []
+          nsamples = len(samples[submodel])
+          float_index = submodel.dag_df.columns.get_loc(name)
+          p_mean_vals = submodel.dag_df.loc['prior_loc'].values.tolist()
+          pdf_effs = np.vstack(submodel.dag_df.loc['fit_engine_dist'].values)
+
+          for sample in tqdm(samples[submodel], desc = 'Calculating marginal likelihoods for submodel ' + submodel.name + '...'):
+            p_mean_vals[float_index] = sample
+            w = np.array(p_mean_vals)
+            logp = np.log(w) + np.log(pdf_effs).T
+            mu = np.sum(np.exp(logp), axis=1).tolist()
+            for bin in mu:
+              bin_likelihoods.append(poisson(bin))
+            for i, likelihood in enumerate(bin_likelihoods):
+              bin_mls.append(likelihood.logpmf(submodel.fit_engine_dist[i]))
+            p.append(sum(bin_mls) + prior.logpdf(sample) - approx_prior.logpdf(sample))
+            bin_likelihoods.clear()
+            bin_mls.clear()
+
+          #print(p)
+          #sys.exit()
+          marg_likelihood[submodel.name] = sum(p)/nsamples
+
+        #delete some vars
+        del likelihood
+        del prior
+        del approx_prior
+        del p
+
+        return marg_likelihood

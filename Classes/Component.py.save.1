@@ -1,0 +1,191 @@
+"""
+Base class for a fit component.
+"""
+import math as mt
+import sys
+import matplotlib.pyplot as plt
+from Tools.DistributionTools import *
+
+class Component:
+	"""
+	Base class for a fit component.
+	"""
+
+	def __init__(self, component_name, component_dict, submodel, settings):
+		self.settings = settings
+		self.submodel = submodel
+
+		self.name = component_name
+		self.component_dict = component_dict
+
+		self.InitData()
+		# self.InitDists()
+
+	def InitData(self):
+		st = self.settings
+
+		self.level = self.component_dict['level']
+		self.floated = self.component_dict['floated']
+		self.units = self.InitUnits()
+
+		# Check if prior params already specified
+		if 'prior_loc' in self.component_dict and self.component_dict['prior_loc'] != None:
+			self.prior_loc = self.component_dict['prior_loc']
+		else:
+			self.InitPriorParams(loc = True)
+		if 'prior_scale' in self.component_dict and self.component_dict['prior_scale'] != None:
+			self.prior_scale = self.component_dict['prior_scale']
+		else:
+			self.InitPriorParams(scale = True)
+
+	def InitDists(self):
+		self.CreateSimulationDist()
+		self.CreateDefaultDist()
+		self.CreateExpectedRateDist()
+
+	def InitRemainingDists(self):
+		self.CreateExpectedDist()
+		self.CreateFitDist()
+		self.CreateFitEngineDist()
+
+	def CreateSimulationDist(self):
+		"""
+		Get the path of the file and then load the distribution from that file.
+		The files retrieved have not been cropped or modified since their sims
+		post-processing. Their units correspond to their post-processing level.
+		"""
+		path = self.component_dict['sim_file_path']
+		temp_sim_dist = np.load(path) # (units of corresponding post-processing) #originally self.sim_dist = np.load(path)
+		cosmo_decay_factor = self.GetCosmogenicDecayFactor()
+		self.sim_dist = temp_sim_dist * cosmo_decay_factor
+
+		#Block for debugging:
+		#if self.component_dict['decay_chain'] == 'Ge68' and self.component_dict['config'] == 'DS5':
+		#	print(cosmo_decay_factor)
+		#	xArray = np.arange(0 + 0.5, 10000 + 0.5)
+		#	plt.step(xArray, temp_sim_dist, where = 'mid', color = 'tab:purple')
+		#	plt.step(xArray, self.sim_dist, where = 'mid', color = 'tab:orange')
+		#	plt.show()
+		#	sys.exit()
+
+	def CreateDefaultDist(self):
+		"""
+		Crop the raw sim_dist to the default range. Then rebin to the default
+		binning.
+		"""
+		st = self.settings
+
+		tmp_dist = CropDistribution(self.sim_dist, st.dft.min, st.dft.max, st.sim.bin_centers, st.sim.bin_wid)
+		if st.variable_bin_size:
+			self.dft_dist = RebinVarBins(tmp_dist, st.var_bin_edges, operation='sum')
+		else:
+			self.dft_dist = Rebin(tmp_dist, (st.dft.bins_n,), operation='sum') # (units of corresponding post-processing, but with energy summed out)
+
+	def CreateFitEngineDist(self):
+		"""
+		Crop the raw sim_dist to the default range. Then rebin to the default
+		binning.
+		"""
+		st = self.settings
+
+		if st.fit_peaks:
+			self.fit_engine_dist = self.fit_dist[st.fit.peaks_i]
+		else:
+			self.fit_engine_dist = self.fit_dist[st.fit.min_dft_i:st.fit.max_dft_i]
+
+	def GetCosmogenicDecayFactor(self):
+		"""
+		Find the factor by which the average activity for a cosmogenic isotope
+		has decreased since the beginning of DS0.  Use this factor to scale
+		the simulated pdf so that the DS0 activity can be floated in the fit. -Chris H.
+		"""
+		#time_constant_days = half_life_yrs * 365.25 days/yr * 1/ln(2)
+		timeconstDict = {
+			'Th': 1.405e10 * 365.25 * 1.44,
+			'U': 4.468e9 * 365.25 * 1.44,
+			'Pb': 22.3 * 365.25 * 1.44,
+			'Co': 5.2713 * 365.25 * 1.44,
+			'57Co': 271.74 * 1.44, #Table value already in days
+			'68Ge': 270.95 * 1.44, #Table value already in days
+			'K': 1.248e9 * 365.25 * 1.44,
+			'54Mn': 312.03 * 1.44, #Table value already in days
+			}
+		config = self.component_dict['config']
+		dC = self.component_dict['decay_chain']
+		if dC == '0v' or dC == '2v' or dC == 'Rn' or dC == 'Th228' or dC == 'DCR' or dC == 'PbBrem':
+			cosmo_decay_factor = 1.0
+		else: 									#replace if statements with array of t_offsets and t_multidatsets (b) in the future
+			if 'DS1-2' in config: #average activity for the DS1-2 multidataset
+			.	t_offset = 196.23 #days, from run 2580 (beg DS0) to run 9422 (beg DS1)
+				b = 180.96 #days, from run 9422 (beg DS1) to run 15803 (end DS2)
+				tau = timeconstDict[dC]
+				j = b/tau
+				k = -1*j
+				t_mean = (tau*(1-(j+1)*mt.exp(k)))/(1-mt.exp(k))
+				t_eff = t_offset + t_mean
+				cosmo_decay_factor = mt.exp((-1*t_eff)/tau)
+			elif 'DS3-6' in config: #average activity for theh DS3-6c multidataset
+				t_offset = 422.27 #days, from run 2580 (beg DS0) to run 16797 (beg DS3)
+				b = 1173 #days, from run 16797 (beg DS3) to run 57103 (end DS6c)
+				tau = timeconstDict[dC]
+				j = b/tau
+				k = -1*j
+				t_mean = (tau*(1-(j+1)*mt.exp(k)))/(1-mt.exp(k))
+				t_eff = t_offset + t_mean
+				cosmo_decay_factor = mt.exp((-1*t_eff)/tau)
+			elif 'DS7' in config: #average activity for the DS7 mulitdataset
+				t_offset = 1611.09 #days, from run 2580 (beg DS0) to run 57623 (beg DS7)
+				b = 275.04 #days, from run 57623 (beg DS7) to run 66813 (end DS7)
+				tau = timeconstDict[dC]
+				j = b/tau
+				k = -1*j
+				t_mean = (tau*(1-(j+1)*mt.exp(k)))/(1-mt.exp(k))
+				t_eff = t_offset + t_mean
+				cosmo_decay_factor = mt.exp((-1*t_eff)/tau)
+			else:
+				cosmo_decay_factor = 1.0
+		#print('        %s of dC %s has an cosmo_decay_factor from config %s that is: %f' % (self.component_dict['hardware_component'],dC,config,cosmo_decay_factor))
+		return cosmo_decay_factor
+
+	#####################
+	# Methods to be overridden by subclasses for specific component types
+	#####################
+
+	def InitUnits(self):
+		"""
+		The units corresponding to the post-processing level. Energy differential
+		has been summed out by Rebin() in Component::CreateDefaultDist(), but
+		can restore with differential = True in other methods.
+		"""
+		print('Component::InitUnits()', 'Overide?')
+
+	def InitPriorParams(self):
+		"""
+		The prior loc, scale, distribution type, and any other parameters.
+		Also set any custom fixed values.
+		"""
+		print('Component::InitPriorParams()', 'Overide?')
+
+	def CreateExpectedRateDist(self):
+		"""
+		The expected background model distribution
+		To be overridden in subclass specific to post-
+		processing level.
+		"""
+		print('Component::CreateExpectedDist()', 'Overide?')
+
+	def CreateExpectedDist(self):
+		"""
+		The expected background model distribution
+		To be overridden in subclass specific to post-
+		processing level.
+		"""
+		print('Component::CreateExpectedDist()', 'Overide?')
+
+	def CreateFitDist(self):
+		"""
+		The distribution in units for the fit.
+		To be overridden in subclass specific to post-
+		processing level.
+		"""
+		print('Component::CreateFitDist()', 'Overide?')

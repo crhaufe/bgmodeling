@@ -1,0 +1,221 @@
+"""
+Tools for getting data and data info
+"""
+
+import sys
+import os
+import json
+import numpy as np
+import h5py
+
+# SOME GLOBAL VARIABLES
+bcs_output_dirname = os.environ['BCSOUTPUTDIR']
+bds_output_dirname = os.environ['BDSOUTPUTDIR']
+channel_data_dirname = os.environ['CHANNELDATADIR']
+days_per_year = 365.25
+secs_per_day = 60 * 60 * 24
+sim_data_cut_dict = {1:'RD',2:'RMD',3:'RMAD',6:'RmD'} #added cut 6}
+detector_type_dict = {'0':'Nat','2':'Enr','02':'All',None:'All'}
+openness_dict = {'open': 'open', 'blind': 'blind', 'openblind': 'open+blind', 'blindopen': 'open+blind'}
+
+class DataTools:
+    """
+    Holds the data info for easy access without having to pass arguments around
+    """
+    def __init__(self, settings):
+        self.settings = settings
+
+    def SetSubModel(self, submodel):
+        self.submodel = submodel
+        self.name = submodel.name
+        self.dataset = self.submodel.submodel_dict['data']['dataset']
+        self.openness = self.submodel.submodel_dict['data']['openness']
+        self.cut = self.submodel.submodel_dict['data']['cut']
+        self.detector_type = self.submodel.submodel_dict['data']['detector_type']
+
+    def GetChannelData(self, ds, openness):
+        """
+        Return dictionary of the channel data for this ds
+        For each channel, the dict holds
+        'CPD': {'good' 'detectorName' 'channel' 'detectorType' 'activeMass' 'liveTime' 'exposure' 'exposureUncert'}.
+        """
+        if openness == 'open':
+            file_path = channel_data_dirname + '/%s_channel_data.json' % ds
+        elif openness == 'blind':
+            file_path = channel_data_dirname + '/%s_%s_channel_data.json' % (ds, openness)
+        else:
+            sys.exit('Error: GetChannelData(): openness not recognized')
+
+        if(os.path.isfile(file_path)):
+            with open(file_path) as channel_data_file:
+                channel_data_dict = json.load(channel_data_file)
+        else:
+            sys.exit('Error: GetChannelData(): os.path.isfile returned false regarding %s' % fullPathToFile)
+
+        return channel_data_dict
+
+    # def GetFileHits(self, cpd, ds, openness):
+    #     return bds_output_dirname + '/%s_%s_%s_%s.npy' % (cpd, ds, openness, sim_data_cut_dict[self.cut])
+
+    def OpenHDF5(self, ds, openness):
+        """
+        Open an .hdf5 file to access the dictionary structure holding data arrays
+        """
+        st = self.settings
+
+        if st.data_cal:
+            dirname = bcs_output_dirname
+            basename = '%s_%s_%s.hdf5' % (ds, openness, st.data_cal_source)
+            file_path = dirname + '/' + basename
+        else:
+            dirname = bds_output_dirname
+            basename = '%s_%s.hdf5' % (ds, openness)
+            file_path = dirname + '/' + basename
+        if(os.path.isfile(file_path)):
+            return h5py.File(file_path, 'r')
+        else:
+            sys.exit('Error: OpenHDF5(): file_path DNE %s' % file_path)
+
+    def GetHitsFromFile(self, cut, cpd, ds, openness):
+        f = self.OpenHDF5(ds, openness)
+        cut_str = sim_data_cut_dict[cut]
+        return f[cpd][cut_str][:]
+
+    def GetRunTimeFromFile(self, ds, openness):
+        """
+        Get runtime from file for calibration data
+        """
+        f = self.OpenHDF5(ds, openness)
+        return f['run_time_s']['run_time_s'][()]
+
+    def GetTruthLists(self, kwargs, spec_dataset, spec_openness, spec_detector, spec_module, spec_detector_type):
+        """
+        Check cuts on which data is accepted
+        The GetTruthLists spec_* args actually represent the current vars. They are fed in
+        with spec_* names for easy comparison with the kwargs that represent a desired cut on the data
+        """
+        data_dict = self.submodel.submodel_dict['data']
+
+        # Check that the current variables obey any spec_* kwargs
+        kwargs_truth_list = [False] # Prep this as false. If kwargs == {}, still want np.all(kwargs_truth_list) to be false
+        if kwargs != {}:
+            # the following loop is a workaround for [eval(key) == kwargs[key] for key in kwargs] which has an in-class scope issue
+            # https://stackoverflow.com/questions/13905741/accessing-class-variables-from-a-list-comprehension-in-the-class-definition
+            kwargs_truth_list = []
+            for key in kwargs:
+                kwargs_truth_list.append(eval(key) == kwargs[key])
+        # Check that the current variables obey any restrictions specified by the submodel's data dictionary
+        data_truth_list = []
+        for key in ['module', 'detector', 'detector_type', 'dataset', 'openness']:
+            if data_dict[key] != None:
+                doAppend = False
+                if key == 'module':
+                    if eval('spec_%s' % key) == data_dict[key]: doAppend = True
+                if key == 'detector':
+                    if eval('spec_%s' % key) == data_dict[key]: doAppend = True
+                if key == 'detector_type':
+                    if str(eval('spec_%s' % key)) in data_dict[key]: doAppend = True
+                if key == 'dataset':
+                    if eval('spec_%s' % key)[2:] in data_dict[key]: doAppend = True
+                if key == 'openness':
+                    if eval('spec_%s' % key) in data_dict[key]: doAppend = True
+                if doAppend:
+                    data_truth_list.append(True)
+        return data_truth_list, kwargs_truth_list
+
+    def GetDataHits(self, **kwargs):
+        """
+        Returns numpy array of hits. Records the exposures for each channel.
+        Use kwargs if you wish to get total_hits under specific conditions.
+        kwargs can include any of:
+            GetDataHits(spec_dataset = x, spec_openness = x, spec_detector = x, spec_module = x, spec_detector_type = x)
+        """
+        st = self.settings
+        d = self.submodel.submodel_dict['data']['dataset_openness_dict']
+
+        total_hits = np.array([])
+
+        # All cpd, ds, openness
+        for ds in d:
+            for openness in d[ds]:
+                channel_data_dict = self.GetChannelData(ds, openness)
+                for cpd in channel_data_dict:
+                    if channel_data_dict[cpd]['good'] and (str(channel_data_dict[cpd]['detectorType']) in self.detector_type):
+                        data_truth_list, kwargs_truth_list = self.GetTruthLists(kwargs, spec_dataset = ds, spec_openness = openness, \
+                            spec_detector = cpd, spec_module = cpd[1], spec_detector_type = channel_data_dict[cpd]['detectorType'])
+                        if np.all(data_truth_list) and ( kwargs == {} or np.all(kwargs_truth_list) ):
+                            d[ds][openness][cpd] = {}
+                            d[ds][openness][cpd]['detector_type'] = channel_data_dict[cpd]['detectorType']
+                            if st.data_cal:
+                                run_time_dy = self.GetRunTimeFromFile(ds, openness) / secs_per_day
+                                d[ds][openness][cpd]['exposure'] = run_time_dy * channel_data_dict[cpd]['activeMass']
+                                d[ds][openness][cpd]['exposureUncert'] = d[ds][openness][cpd]['exposure'] * (channel_data_dict[cpd]['exposureUncert']/channel_data_dict[cpd]['exposure'])
+                            else:
+                                d[ds][openness][cpd]['exposure'] = channel_data_dict[cpd]['exposure'] # (kg*dy)
+                                d[ds][openness][cpd]['exposureUncert'] = channel_data_dict[cpd]['exposureUncert'] # (kg*dy)
+                            d[ds][openness][cpd][self.cut] = self.GetHitsFromFile(self.cut, cpd, ds, openness) # d[ds][openness][cpd][self.cut] = np.load(self.GetFileHits(cpd, ds, openness))
+                            total_hits = np.append(total_hits, d[ds][openness][cpd][self.cut])
+
+                            # tmp_hits = np.load(self.GetFileHits(cpd, ds, openness))
+                            # total_hits = np.append(total_hits, tmp_hits)
+
+        return total_hits
+
+    def GetExposure(self, **kwargs):
+        """
+        Only include cpd exposures for datasets in which the cpds were active.
+        Use kwargs if you wish to get total_hits under specific conditions.
+        kwargs can include any of:
+            GetDataHits(spec_dataset = x, spec_openness = x, spec_detector = x, spec_module = x, spec_detector_type = x)
+        """
+        st = self.settings
+        d = self.submodel.submodel_dict['data']['dataset_openness_dict']
+
+        # All cpd, ds, openness
+        exposure = 0. # (kg*dy)
+        uncert = np.array([]) # (kg*dy)
+        for ds in d:
+            for openness in d[ds]:
+                channel_data_dict = self.GetChannelData(ds, openness)
+                for cpd in channel_data_dict: # for cpd in d[ds][openness]:
+                    if channel_data_dict[cpd]['good'] and (str(channel_data_dict[cpd]['detectorType']) in self.detector_type):
+                        data_truth_list, kwargs_truth_list = self.GetTruthLists(kwargs, spec_dataset = ds, spec_openness = openness, \
+                            spec_detector = cpd, spec_module = cpd[1], spec_detector_type = channel_data_dict[cpd]['detectorType'])
+                        if np.all(data_truth_list) and ( kwargs == {} or np.all(kwargs_truth_list) ):
+                            # exposure += d[ds][openness][cpd]['exposure'] # (kg*dy)
+                            # uncert = np.append(uncert, d[ds][openness][cpd]['exposureUncert']) # (kg*dy)
+                            if st.data_cal:
+                                run_time_dy = self.GetRunTimeFromFile(ds, openness) / secs_per_day
+                                exposure += run_time_dy * channel_data_dict[cpd]['activeMass']
+                                tmp_uncert = run_time_dy * channel_data_dict[cpd]['activeMass'] * (channel_data_dict[cpd]['exposureUncert']/channel_data_dict[cpd]['exposure'])
+                                uncert = np.append(uncert, tmp_uncert) # (kg*dy)
+                            else:
+                                exposure += channel_data_dict[cpd]['exposure'] # (kg*dy)
+                                tmp_uncert = channel_data_dict[cpd]['exposureUncert'] # (kg*dy)
+                                uncert = np.append(uncert, tmp_uncert) # (kg*dy)
+
+        if exposure == 0.:
+            print('Warning: GetExposure(): Received item with 0 exposure. Due to spec_detector_type?')
+
+        exposure_uncert = np.sqrt( np.sum( uncert**2 ) ) # (kg*dy)
+        exposure = exposure * 1/days_per_year # (kg*dy)*(yr/dy) = (kg*yr)
+        exposure_uncert = exposure_uncert * 1/days_per_year # (kg*dy)*(yr/dy) = (kg*yr)
+
+        return exposure, exposure_uncert
+
+    def GetLivetime(self, ds):
+        st = self.settings
+        livetime = 0.0
+
+        #ThCalibration data
+        if ds=="DS6cal": livetime = 122752554280310.0 #sec, pending Anna's response
+
+	#RnCalibration data
+	if ds=="DS6Rn": livetime = 0.0 #fill in once available
+
+        #Background data
+        if ds=="DS1-2": livetime = 10380247.05385147 #sec
+	if ds=="DS3-6": livetime = 83613604.04905578 #sec
+	if ds=="DS7": livetime = 15211023.12686105 #sec
+
+        return livetime
